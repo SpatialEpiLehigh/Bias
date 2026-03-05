@@ -1,0 +1,461 @@
+---
+title: "Cluster Detection: Bias, MAUP, Population-at-Risk & Uncertainty"
+subtitle: "Spatial Epidemiology"
+author: "Eric Delmelle"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-title: "Contents"
+    number-sections: true
+    theme: cosmo
+    highlight-style: github
+    code-fold: true
+    code-tools: true
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r setup}
+#| include: false
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(patchwork)
+library(scales)
+```
+
+# Introduction
+
+Spatial cluster detection is a cornerstone of epidemiological surveillance. Yet the visual power of a "hotspot map" can lull analysts into a false sense of objectivity. Every analytical decision — how to define zones, which denominator to use, over what time window — shapes the result. This lecture unpacks four critical methodological challenges:
+
+1. **Bias and the Modifiable Areal Unit Problem (MAUP)**
+2. **Choosing the right population-at-risk**
+3. **Temporal caveats** in cluster identification
+4. **Communicating uncertainty**, including margins of error from the ACS
+
+::: {.callout-important}
+**Core principle:** A cluster map is always the product of *analytical choices*, not just the data. Every choice introduces potential bias — making transparency non-negotiable.
+:::
+
+---
+
+# Bias and the Modifiable Areal Unit Problem (MAUP)
+
+## What Is the MAUP?
+
+The **Modifiable Areal Unit Problem** (Openshaw, 1984) captures the sensitivity of spatial statistics to how geographic units are constructed. It operates through two mechanisms:
+
+- **Scale effect** — results change as data are aggregated from finer to coarser units (e.g., block groups → tracts → counties).
+- **Zoning effect** — results change when *different configurations of the same scale* are applied (e.g., two alternative tract boundaries drawn over the same block-level data).
+
+Both effects arise because areal units are *administrative conveniences*, not natural partitions of the disease process.
+
+## A Simulated Illustration
+
+```{r maup-plot}
+#| fig-cap: "MAUP scale effect: spatial autocorrelation (Moran's I) tends to increase as areal units become coarser. Values shown are illustrative."
+#| fig-height: 3.5
+#| fig-width: 7
+
+maup_df <- tibble(
+  level     = c("Block groups\n(n≈220,000)", "Census tracts\n(n≈74,000)",
+                "Counties\n(n≈3,100)", "States\n(n=50)"),
+  morans_I  = c(0.09, 0.24, 0.42, 0.67),
+  level_ord = 1:4
+)
+
+ggplot(maup_df, aes(x = reorder(level, level_ord), y = morans_I)) +
+  geom_col(fill = "#2c7bb6", width = 0.55) +
+  geom_text(aes(label = morans_I), vjust = -0.5, size = 3.5, fontface = "bold") +
+  scale_y_continuous(limits = c(0, 0.82)) +
+  labs(
+    x = "Geographic unit",
+    y = "Moran's I (spatial autocorrelation)",
+    title = "Scale Effect of MAUP",
+    subtitle = "Same simulated disease data — different spatial aggregations"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+::: {.callout-note}
+**Implication:** Reporting a single Moran's I or a single SaTScan result without sensitivity analysis across scales is incomplete. A cluster that is "significant" at the tract level may dissolve or strengthen at the county level.
+:::
+
+## Zoning Effect
+
+Even at a fixed scale, redrawing boundaries changes results. Gerrymandering of health districts is a real-world manifestation: administrative lines can split a true disease cluster across units, making each sub-unit appear unremarkable.
+
+**Practical remedies:**
+
+| Strategy | Description |
+|---|---|
+| Multi-scale analysis | Run cluster detection at 2–3 levels; report consistency |
+| Kernel density estimation | Avoids fixed boundaries entirely |
+| Areal interpolation | Reaggregate to a common grid (e.g., hexagonal bins) |
+| Sensitivity analysis | Compare results under alternative zoning schemes |
+
+## Other Sources of Bias in Cluster Detection
+
+Beyond MAUP, analysts must guard against:
+
+- **Edge effects** — clusters near study area boundaries are censored; buffer the study region.
+- **Ecological fallacy** — inferences at the group level may not hold for individuals.
+- **Detection bias** — higher diagnostic intensity in urban areas inflates apparent urban clusters.
+- **Reporting/surveillance bias** — passive surveillance misses cases where healthcare access is poor.
+- **Spatial confounding** — unmeasured socioeconomic or environmental covariates may explain apparent clusters.
+
+## Geocoding Error and Its Impact on Clusters
+
+A less-discussed but consequential source of bias is **positional error introduced during geocoding** — the process of assigning coordinates to addresses. Even small geocoding errors can affect cluster detection: Burra et al. (2002) found that errors affecting less than 1% of a dataset produced significantly different mortality clusters. Jacquez et al. (2000) documented inflated standard errors and reduced statistical power to detect clusters, while rural areas are disproportionately affected due to sparse address infrastructure (e.g., PO Boxes, rural routes).
+
+When addresses cannot be precisely geocoded, **geoimputation** is used — assigning approximate locations from a centroid or population-weighted centroid of the enclosing zone. However, different imputation strategies (geometric centroid, parcel data, randomized block population, dasymetric mapping) produce meaningfully different travel and exposure estimates (Delmelle et al., 2021). Using a single centroid collapses spatial heterogeneity within a zone into a binary decision, masking the true distribution of risk.
+
+::: {.callout-warning}
+**Practical advice:** Always document your geocoding match rate, the reference dataset used, and any imputation strategy applied to unmatched records. Excluding non-geocoded cases introduces selection bias — rural and minority populations are systematically more likely to fail geocoding.
+:::
+
+---
+
+# Population-at-Risk
+
+## Why the Denominator Matters
+
+Counts alone are meaningless without an appropriate denominator. A census tract with 50 cases may be unremarkable if 20,000 people live there, or alarming if the population is 500.
+
+**Population-at-risk (PAR)** should reflect the group *actually exposed to the risk of the outcome* — not merely the residential population.
+
+## Choosing the Right Denominator
+
+```{r par-table}
+#| echo: false
+par_df <- tribble(
+  ~`Disease / Outcome`,       ~`Preferred Denominator`,               ~`Common Mistake`,
+  "Childhood leukemia",        "Children 0–14 in census area",         "Total population",
+  "Occupational injury",       "Workers in industry / sector",          "Total adults",
+  "Motor vehicle crash",       "Vehicle miles traveled (VMT)",          "Residential population",
+  "Foodborne illness",         "Restaurant patrons / meals served",     "Census population",
+  "COVID-19 hospitalization",  "Age-stratified unvaccinated pop.",      "Total population",
+  "Breast cancer",             "Women ≥40 (or screened population)",    "All women"
+)
+
+kable(par_df,
+      caption = "Population-at-Risk: Common mismatches in spatial epidemiology") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+## Visualizing Rate Instability in Small Populations
+
+The **small denominator problem**: sparse populations produce highly variable rates, inflating or deflating apparent risk.
+
+```{r rate-instability}
+#| fig-cap: "Rate instability: as population size decreases, observed rates (per 1,000) become unreliable even when the true underlying rate is constant at 10/1,000."
+#| fig-height: 4
+#| fig-width: 7
+
+set.seed(123)
+true_rate <- 0.01  # 10 per 1,000
+
+sim_df <- tibble(
+  pop_size = rep(c(50, 200, 500, 2000, 10000), each = 300)
+) |>
+  mutate(
+    cases         = rbinom(n(), size = pop_size, prob = true_rate),
+    observed_rate = (cases / pop_size) * 1000
+  )
+
+ggplot(sim_df, aes(x = factor(pop_size), y = observed_rate)) +
+  geom_violin(fill = "#d7191c", alpha = 0.55, color = NA) +
+  geom_boxplot(width = 0.15, outlier.size = 0.4, fill = "white") +
+  geom_hline(yintercept = 10, linetype = "dashed", linewidth = 0.8) +
+  annotate("text", x = 5.4, y = 11.5,
+           label = "True rate = 10/1,000",
+           size = 3.2, hjust = 1) +
+  labs(
+    x = "Population size",
+    y = "Observed rate (per 1,000)",
+    title = "Rate Instability in Small Populations",
+    subtitle = "300 simulations per stratum; true rate constant at 10/1,000"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+**Empirical Bayes smoothing** (e.g., `EBest()` in `spdep`) and **spatial Bayesian models** (e.g., BYM model in INLA) borrow strength from neighbors to stabilize rates in sparse areas.
+
+---
+
+# Temporal Caveats in Cluster Detection
+
+## Space–Time vs. Purely Spatial Clusters
+
+Disease clusters have a **temporal dimension** that purely spatial methods ignore. A cluster detected over a 10-year aggregation may obscure:
+
+- A **transient outbreak** that peaked and resolved
+- **Secular trends** — gradual citywide increases unrelated to local clustering
+- **Surveillance changes** — new reporting requirements introduced mid-period
+- **Population shifts** — demographic change alters the PAR mid-window
+
+## Aggregation Window and Signal Detection
+
+```{r temporal-windows}
+#| fig-cap: "A transient cluster (weeks 30–50) is visually prominent in weekly data but would be diluted — and potentially non-significant — if cases were aggregated over the full 2-year period."
+#| fig-height: 4
+#| fig-width: 8
+
+set.seed(99)
+weeks     <- 1:104
+baseline  <- rpois(104, lambda = 5)
+cluster_signal <- baseline
+cluster_signal[30:50] <- cluster_signal[30:50] + rpois(21, lambda = 15)
+
+ts_df <- tibble(
+  week   = weeks,
+  area_A = cluster_signal,
+  area_B = rpois(104, lambda = 5)
+) |>
+  pivot_longer(-week, names_to = "area", values_to = "cases")
+
+ggplot(ts_df, aes(x = week, y = cases, color = area)) +
+  geom_line(linewidth = 0.8, alpha = 0.85) +
+  annotate("rect", xmin = 30, xmax = 50, ymin = -Inf, ymax = Inf,
+           alpha = 0.12, fill = "red") +
+  annotate("text", x = 40, y = 32,
+           label = "True cluster\n(weeks 30–50)",
+           size = 3.2, color = "red", fontface = "bold") +
+  scale_color_manual(
+    values = c("area_A" = "#d7191c", "area_B" = "#2c7bb6"),
+    labels = c("Area A (cluster)", "Area B (background)")
+  ) +
+  labs(
+    x = "Week", y = "Case count",
+    title = "Transient Cluster Hidden by Long Aggregation Windows",
+    subtitle = "Aggregating all 104 weeks masks the peak signal in Area A",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "bottom")
+```
+
+## Key Temporal Caveats
+
+| Caveat | Description | Mitigation |
+|---|---|---|
+| **Window length** | Too long → masks transient clusters; too short → insufficient power | Prospective scan with rolling windows (SaTScan) |
+| **Multiple testing over time** | Sequential testing inflates Type I error | Kulldorff prospective scan corrects via Monte Carlo |
+| **Reporting lag** | Cases reported weeks after onset distort timing | Use onset date, not report date |
+| **Seasonality** | Confounds cluster significance in seasonal diseases | Season-adjust expected counts |
+| **Population flux** | Denominator changes mid-period (migration, disasters) | Interpolate annual PAR |
+
+## Residential Mobility
+
+Most cluster studies assume patients remain at their recorded address throughout the study period — an assumption that rarely holds. Delmelle et al. (2021) illustrate how ignoring residential mobility can both *create* spurious clusters (cases incorrectly attributed to a prior address) and *mask* real ones (cases redistributed across units after a move). In longitudinal studies, approximately 22% of pregnant women in Atlanta changed residence between conception and delivery, biasing exposure and risk estimates at the maternal address.
+
+::: {.callout-note}
+Where residential histories are available (e.g., hospital discharge records, Medicaid linkages), tracking address changes substantially improves the validity of space–time cluster analyses.
+:::
+
+::: {.callout-tip}
+**SaTScan** implements space–time scan statistics that simultaneously evaluate spatial, temporal, and space–time cylinders, correcting for multiple testing via Monte Carlo simulation.
+:::
+
+---
+
+# Communicating Uncertainty
+
+## Why Uncertainty Communication Fails
+
+Uncertainty is routinely underreported in cluster maps and epidemiological bulletins. Common failure modes:
+
+- Reporting **point estimates** of rates with no confidence interval
+- Presenting **p-values** without effect sizes or absolute risk differences
+- Using **choropleth maps** without acknowledging that small-area estimates carry wide uncertainty
+- Treating **ACS estimates** as exact counts
+
+## The ACS and Its Margins of Error
+
+The **American Community Survey (ACS)** is the primary annual source of sociodemographic denominators for spatial epidemiology in the U.S. Unlike the decennial census (a full enumeration), the ACS is a **continuous sample survey** — approximately 3.5 million households per year — producing *estimates*, not counts.
+
+### How Is the ACS MOE Calculated?
+
+The Census Bureau uses a **generalized variance function (GVF)** approach based on the **successive difference replication (SDR)** method with 80 replicate weights.
+
+For a proportion $\hat{p}$ estimated from $n$ respondents with design effect $\text{DEFF}$:
+
+$$
+\text{SE}(\hat{p}) = \sqrt{\frac{\hat{p}(1-\hat{p})}{n} \times \text{DEFF}}
+$$
+
+The published **90% margin of error** is:
+
+$$
+\text{MOE}_{90\%} = 1.645 \times \text{SE}(\hat{p})
+$$
+
+To convert to a **95% MOE** (more familiar in epidemiology):
+
+$$
+\text{MOE}_{95\%} = \frac{1.96}{1.645} \times \text{MOE}_{90\%} \approx 1.191 \times \text{MOE}_{90\%}
+$$
+
+### 1-Year vs. 5-Year ACS
+
+| Product | Coverage | Approx. sample | Best use |
+|---|---|---|---|
+| **ACS 1-year** | Areas ≥ 65,000 pop. | ~3.5 M HH/year | Large cities, states; timeliness matters |
+| **ACS 5-year** | All geographies | ~17.5 M HH pooled | Census tracts, block groups; precision matters |
+
+::: {.callout-warning}
+**ACS 5-year estimates** span a 60-month window. Comparing two overlapping 5-year products (e.g., 2016–2020 vs. 2018–2022) is statistically problematic because ~60% of the samples overlap. Prefer non-overlapping windows for formal inference.
+:::
+
+### Visualizing MOE Across Geographies
+
+```{r acs-moe}
+#| fig-cap: "Illustrative ACS uncertainty for poverty rate estimates. Smaller geographies carry much wider confidence intervals."
+#| fig-height: 4
+#| fig-width: 7
+
+acs_df <- tibble(
+  geography = c("Nation", "State (PA)", "County (Lehigh Co.)",
+                "Census tract", "Block group"),
+  estimate  = c(12.8, 12.1, 11.5, 13.2, 14.0),
+  moe_90    = c(0.1,  0.3,  1.2,  3.8,  8.5)
+) |>
+  mutate(
+    moe_95    = moe_90 * 1.191,
+    lower_95  = estimate - moe_95,
+    upper_95  = estimate + moe_95,
+    geography = factor(geography,
+                       levels = rev(c("Nation", "State (PA)",
+                                      "County (Lehigh Co.)",
+                                      "Census tract", "Block group")))
+  )
+
+ggplot(acs_df, aes(x = estimate, y = geography)) +
+  geom_errorbarh(aes(xmin = lower_95, xmax = upper_95),
+                 height = 0.3, color = "#d7191c", linewidth = 1.1) +
+  geom_point(size = 4, color = "#2c7bb6") +
+  labs(
+    x = "Poverty rate estimate (%) — 95% CI",
+    y = NULL,
+    title = "ACS Uncertainty Grows at Finer Geographic Scales",
+    subtitle = "Illustrative 5-year ACS estimates; error bars = 95% CI"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+### Coefficient of Variation as a Reliability Flag
+
+The Census Bureau flags estimates where the **coefficient of variation (CV)** exceeds 30% as "use with caution":
+
+$$
+\text{CV} = \frac{\text{SE}}{\hat{x}} \times 100\%
+= \frac{\text{MOE}_{90\%} / 1.645}{\hat{x}} \times 100\%
+$$
+
+```{r cv-chart}
+#| fig-cap: "CV grows rapidly at the block group level. Estimates with CV > 30% (red dashed line) should be used cautiously or suppressed in public maps."
+#| fig-height: 3.5
+#| fig-width: 7
+
+acs_df |>
+  mutate(
+    SE = moe_90 / 1.645,
+    CV = (SE / estimate) * 100
+  ) |>
+  ggplot(aes(x = fct_rev(geography), y = CV)) +
+  geom_col(aes(fill = CV > 30), width = 0.55, show.legend = FALSE) +
+  geom_hline(yintercept = 30, linetype = "dashed",
+             color = "red", linewidth = 0.9) +
+  annotate("text", x = 1.5, y = 32, label = "CV = 30% threshold",
+           size = 3, color = "red") +
+  scale_fill_manual(values = c("FALSE" = "#2c7bb6", "TRUE" = "#d7191c")) +
+  coord_flip() +
+  labs(
+    x = NULL, y = "Coefficient of Variation (%)",
+    title = "ACS Reliability: Coefficient of Variation by Geography",
+    subtitle = "Poverty rate estimates — illustrative values"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+### Aggregating MOEs
+
+When combining ACS estimates (e.g., summing sub-populations), MOEs **do not simply add**. The Census Bureau prescribes:
+
+$$
+\text{MOE}_{\text{sum}} = \sqrt{\text{MOE}_1^2 + \text{MOE}_2^2 + \cdots + \text{MOE}_k^2}
+$$
+
+For a **derived proportion** $\hat{p} = \hat{x}/\hat{y}$:
+
+$$
+\text{MOE}_{\hat{p}} = \frac{1}{\hat{y}} \sqrt{\text{MOE}_x^2 - \hat{p}^2 \cdot \text{MOE}_y^2}
+$$
+
+If the term under the radical is negative (which can occur with high correlation between numerator and denominator), substitute addition for the inner subtraction.
+
+## Mapping Uncertainty
+
+A single choropleth communicates the *estimate*. A responsible analyst also communicates *reliability*.
+
+**Bivariate approaches (from Delmelle et al., 2021):**
+
+- **Value-by-alpha maps** — opacity encodes uncertainty; opaque tracts = reliable estimates, transparent tracts = high error. Intuitive for general audiences.
+- **Bivariate choropleth** — two distinct color schemes simultaneously encode the attribute and its CV class. Requires careful legend design to avoid cognitive overload.
+- **Uncertainty overlay** — hatch or stipple areas where CV > 30%
+- **Exceedance probability maps** — from Bayesian models: probability that the true rate exceeds a threshold
+- **Cartogram** — scale polygons by sample size so small, unreliable units shrink visually
+
+Research also shows that ACS uncertainty has **structural spatial patterns**: uncertainty tends to be highest in high-income tracts (smaller group sizes inflate variance) and in areas farther from urban centers — meaning bias in ACS-derived denominators is not random but geographically patterned (Folch et al., 2016).
+
+::: {.callout-note}
+The **CDC PLACES** platform uses **multilevel regression and poststratification (MrP)** to produce small-area health estimates with uncertainty bounds at the census tract and ZIP code level — a model-based alternative to direct ACS estimates for outcomes not captured by ACS.
+:::
+
+## Communicating to Non-Technical Audiences
+
+| Context | Recommended approach |
+|---|---|
+| Public health bulletin | Natural frequencies: "3 in 100 residents" rather than a rate |
+| Press release | Report a range: "between 8% and 14%", not just a point estimate |
+| Policy brief | Show confidence intervals on all maps; highlight unreliable areas |
+| Interactive dashboard | Enable toggling between estimate layer and uncertainty layer |
+| Academic paper | Report Moran's I p-values alongside effect size; include sensitivity tables |
+
+> *"A map that shows only the estimate, without the uncertainty, is a half-truth."*
+> — Adapted from MacEachren et al. (2005)
+
+---
+
+# Summary
+
+| Topic | Core takeaway |
+|---|---|
+| **MAUP** | Spatial results are scale- and zoning-dependent; always test sensitivity |
+| **Population-at-risk** | Match denominator to the truly exposed group; avoid ecological shortcuts |
+| **Temporal caveats** | Window length and surveillance change bias space–time cluster detection |
+| **ACS uncertainty** | MOE₉₀ = 1.645 × SE; grows rapidly at small geographies; propagate correctly |
+| **Communicating uncertainty** | Map estimates *and* reliability; use natural frequencies for public audiences |
+
+---
+
+# Further Reading
+
+- Openshaw, S. (1984). *The Modifiable Areal Unit Problem.* Geo Books.
+- Kulldorff, M. (1997). A spatial scan statistic. *Communications in Statistics — Theory and Methods*, 26(6), 1481–1496.
+- U.S. Census Bureau. (2020). *Understanding and Using American Community Survey Data: What All Data Users Need to Know.*
+- Lawson, A. B. (2018). *Bayesian Disease Mapping* (3rd ed.). CRC Press.
+- MacEachren, A. M., et al. (2005). Visualizing geospatial information uncertainty. *Cartography and Geographic Information Science*, 32(2), 139–160.
+- Walker, K. (2023). *Analyzing US Census Data: Methods, Maps, and Models in R.* CRC Press. <https://walker-data.com/census-r/>
+- Delmelle, E. M., Desjardins, M. R., Jung, P., Owusu, C., Lan, Y., Hohl, A., & Dony, C. (2022). Uncertainty in geospatial health: challenges and opportunities ahead. *Annals of Epidemiology*, 65, 15–26. <https://doi.org/10.1016/j.annepidem.2021.10.002>
